@@ -1,21 +1,27 @@
 """
 Vector Store Service with Hybrid search (Dense + Sparse)
-Supports multiple backends: Pinecone, Qdrant, OpenSearch
+Production Ready: Uses FastEmbed for SPLADE/BGE-M3 generation.
 """
 from typing import List, Dict, Any, Optional
 from abc import ABC, abstractmethod
-import numpy as np
-from langchain_huggingface import HuggingFaceEmbeddings
-from rank_bm25 import BM25Okapi
-import structlog
 import uuid
+import asyncio
 
-from pinecone import Pinecone, ServerlessSpec
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import structlog
+from langchain_huggingface import HuggingFaceEmbeddings
+from fastembed import SparseTextEmbedding
+
+# Backend Clients
+from pinecone import Pinecone, ServerlessSpec, PineconeException
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, Distance, VectorParams, PointStruct
-
+from qdrant_client.models import (
+    Filter, FieldCondition, MatchValue, Distance, VectorParams,
+    PointStruct, SparseVectorParams, SparseVector
+)
 
 from app.core.config import settings
+import structlog
 
 logger = structlog.get_logger()
 
@@ -24,14 +30,12 @@ class VectorStoreBackend(ABC):
     """Abstract base class for vector store backends"""
     
     @abstractmethod
-    async def add_document(
+    async def add_document_batch(
         self,
-        text: str,
-        embedding: List[float],
-        metadata: Dict[str, Any],
+        documents: List[Dict[str, Any]],
         collection: str
-    ) -> str:
-        """Add a document to the vetor store"""
+    ) -> List[str]:
+        """Add a batch of documents to the vetor store (More efficient)"""
         pass
     
     @abstractmethod
@@ -39,10 +43,11 @@ class VectorStoreBackend(ABC):
         self,
         query_embedding: List[float],
         collection: str,
+        query_sparse: Optional[Dict[str, float]] = None, # Added for native hybrid
         top_k: int = 10,
         filter: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]] :
-        """Perform similarity search"""
+        """Perform similarity or hybrid search natively in DB"""
         pass
     
     @abstractmethod
@@ -57,12 +62,15 @@ class PineconeBackend(VectorStoreBackend):
         self.pc = Pinecone(api_key=settings.PINECONE_API_KEY)
         self.index_name = settings.PINECONE_INDEX_NAME
         
-        # Create index if it doesn't exist
-        if self.index_name not in [idx.name for idx in self.pc.list_indexes()]:
+        # Check if index exists (Cached lookup in production usually)
+        existing_indexes = [idx.name for idx in self.pc.list_indexes()]
+        
+        if self.index_name not in existing_indexes:
+            logger.info("creating_pinecone_index", name=self.index_name)
             self.pc.create_index(
                 name = self.index_name,
                 dimension= settings.DIMENSION,
-                metric = "cosine",
+                metric = "dotproduct", # Recommended for Hybrid
                 spec=ServerlessSpec(
                     cloud="aws",
                     region=settings.PINECONE_ENVIRONMENT
@@ -71,42 +79,68 @@ class PineconeBackend(VectorStoreBackend):
         
         self.index = self.pc.Index(self.index_name)
         
-        
-    async def add_document(
+    @retry(
+        stop= stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry= retry_if_exception_type(PineconeException)
+    )   
+    async def add_document_batch(
         self,
-        text: str,
-        embedding: List[float],
-        metadata: Dict[str, Any],
+        documents: List[Dict[str, Any]],
         collection: str
-    )-> str:
-        """Add document to Pinecone"""
-        doc_id = str(uuid.uuid4())
+    )-> List[str]:
+        """Batch upsert ith retries"""
+        vectors_to_upsert = []
+        doc_ids = []
         
-        # Add Collection to metadata
-        full_metadata = {**metadata, "collection": collection, "text":text}
+        for doc in documents:
+            doc_id = doc.get("id", str(uuid.uuid4()))
+            doc_ids.append(doc_id)
+            
+            # Prepare metadata
+            metadata = doc.get("metadata", {})
+            metadata["text"] = doc.get("text", "")
+            metadata["collection"] = collection
+            
+            # Prepare vector structure
+            vector_data = {
+                "id" : doc_id,
+                "values" : doc["dense_embedding"],
+                "metadata" : metadata
+            }
+            
+            # Map FastEmbed output to Pinecone Sparse format
+            if "sparse_embedding" in doc and doc["sparse_embedding"]:
+                vector_data["sparse_values"] = {
+                    "indices" : [int(i) for i in doc["sparse_embedding"].indices],
+                    "values" : [float(v) for v in doc["sparse_embedding"].values]
+                }
+            vectors_to_upsert(vector_data)
         
-        # Upsert to Pinecone
-        self.index.upsert(
-            vectors=[(doc_id, embedding, full_metadata)],
-            namespace=collection
-        )
-        return doc_id
+        # Pinecone upsert (Namespace acts as Collection)
+        self.index.upsert(vectors=vectors_to_upsert, namespace=collection)
+        return doc_ids
     
-    async def similarity_search(
-        self,
-        query_embedding: List[float],
-        collection: str,
-        top_k : int = 10,
-        filter: Optional[Dict[str, Any]]= None
-    )-> List[Dict[str, Any]]:
-        """Search in Pinecone"""
-        results= self.index.query(
-            vector= query_embedding,
-            top_k = top_k,
-            include_metadata=True,
-            namespace=collection,
-            filter= filter  
-        )
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(main=1, max=5))
+    async def similarity_search(self, query_dense, collection, query_sparse=None, top_k=10, filter=None):
+        
+        # Prepare arguments
+        search_kwargs = {
+            "vector" : query_dense,
+            "top_k" : top_k,
+            "include_metadata" : True,
+            "namespace" : collection,
+            "filter" : filter
+        }
+        
+        # Add sparse vector if provided
+        if query_sparse:
+            search_kwargs["sparse_vector"] = {
+                "indices" : [int(i) for i in query_sparse.indices],
+                "values" :  [float(v) for v in query_sparse.values]
+            }
+        
+        results = self.index.query(**search_kwargs)
         
         return [
             {
@@ -119,366 +153,170 @@ class PineconeBackend(VectorStoreBackend):
         ]
         
     async def delete_document(self, doc_id: str, collection: str):
-        """Delte from Pinecone"""
         self.index.delete(ids=[doc_id], namespace=collection)
-        
-    async def update_document(
-        self,
-        doc_id: str,
-        embedding: List[float],
-        metadata: Dict[str, Any],
-        collection: str
-    ):
-        """Update document in Pinecone"""
-        full_metadta= {**metadata, "collection": collection}
-        self.index.upsert(
-            vectors=[(doc_id, embedding, full_metadta)],
-            namespace= collection
-        )
-    
-    async def get_document(
-        self,
-        doc_id: str,
-        collection: str
-    ) -> Optional[Dict[str, Any]]:
-        """Get document by ID"""
-        result = self.index.fetch(ids=[doc_id], namespace=collection)
-        if result.vectors and doc_id in result.vectors:
-            vector_data = result.vectors[doc_id]
-            return{
-                "id" : doc_id,
-                "metadata": vector_data.metadata,
-                "text" : vector_data.metadata.get("text")
-            }
-        return None
+
     
 class QdrantBackend(VectorStoreBackend):
-    """Qdrant vector store backend"""
-    
     def __init__(self):
-        
-        
-        self.client = QdrantClient(
-            url=settings.QDRANT_URL,
-            api_key=settings.QDRANT_API_KEY
-        )
+        self.client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
     
-    async def add_document(
-        self,
-        text: str,
-        embedding: List[float],
-        metadata: Dict[str, Any],
-        collection: str
-    ) -> str:
-        """Add document to Qdrant"""
-        
-        # Ensure collection exists
-        try:
-            self.client.get_collection(collection)
-        except:
+    async def _ensure_collection(self, collection_name: str):
+        if not self.client.collection_exists(collection_name):
             self.client.create_collection(
-                collection_name=collection,
-                vectors_config=VectorParams(size=1536, distance=Distance.COSINE)
+                collection_name=collection_name,
+                vectors_config={"dense": VectorParams(size=settings.DIMENSION, distance=Distance.COSINE)},
+                sparse_vectors_config={"sparse": SparseVectorParams(index=SparseVectorParams(on_disk=True))}
             )
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+    async def add_documents_batch(self, documents: List[Dict[str, Any]], collection: str) -> List[str]:
+        await self._ensure_collection(collection)
+        points = []
+        doc_ids = []
         
-        doc_id = str(uuid.uuid4())
-        point = PointStruct(
-            id=doc_id,
-            vector=embedding,
-            payload={**metadata, "text": text}
-        )
-        
-        self.client.upsert(collection_name=collection, points=[point])
-        return doc_id
-    
-    async def similarity_search(
-        self,
-        query_embedding: List[float],
-        collection: str,
-        top_k: int = 10,
-        filter: Optional[Dict[str, Any]] = None
-    ) -> List[Dict[str, Any]]:
-        """Search in Qdrant"""
-        
-        # Build filter if provided
+        for doc in documents:
+            doc_id = doc.get("id", str(uuid.uuid4()))
+            doc_ids.append(doc_id)
+            
+            vector_struct = {"dense": doc["dense_embedding"]}
+            
+            # Map FastEmbed output to Qdrant Sparse format
+            if "sparse_embedding" in doc and doc["sparse_embedding"]:
+                vector_struct["sparse"] = SparseVector(
+                    indices=doc["sparse_embedding"].indices.tolist(),
+                    values=doc["sparse_embedding"].values.tolist()
+                )
+
+            points.append(PointStruct(
+                id=doc_id, 
+                vector=vector_struct, 
+                payload={**doc.get("metadata", {}), "text": doc.get("text", "")}
+            ))
+            
+        self.client.upsert(collection_name=collection, points=points)
+        return doc_ids
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5))
+    async def similarity_search(self, query_dense, collection, query_sparse=None, top_k=10, filter=None):
         qdrant_filter = None
         if filter:
-            conditions = [
-                FieldCondition(key=k, match=MatchValue(value=v))
-                for k, v in filter.items()
-            ]
+            conditions = [FieldCondition(key=k, match=MatchValue(value=v)) for k, v in filter.items()]
             qdrant_filter = Filter(must=conditions)
-        
+            
+        # Qdrant Hybrid Query (Simplest implementation using Fusion)
+        # Note: True Hybrid in Qdrant 1.10+ uses Prefetch, simplified here to dense search
         results = self.client.search(
             collection_name=collection,
-            query_vector=query_embedding,
+            query_vector=("dense", query_dense),
             limit=top_k,
             query_filter=qdrant_filter
         )
-        
-        return [
-            {
-                "id": str(hit.id),
-                "score": hit.score,
-                "metadata": hit.payload,
-                "text": hit.payload.get("text", "")
-            }
-            for hit in results
-        ]
-    
+        return [{"id": str(h.id), "score": h.score, "metadata": h.payload, "text": h.payload.get("text", "")} for h in results]
+
     async def delete_document(self, doc_id: str, collection: str):
-        """Delete from Qdrant"""
         self.client.delete(collection_name=collection, points_selector=[doc_id])
-        
 
 class VectorStore:
     """
-    Main vector store interface with hybrid search capabilities.
-    
-    Combines dense vector search with sparse MB25 search for better retrieval.
+    Production Vector Store with SPLADE/BGE-M3 integration.
     """
     
     def __init__(
         self,
         backend: VectorStoreBackend,
-        embeddings: Optional[HuggingFaceEmbeddings] = None
+        embeddings: Optional[HuggingFaceEmbeddings] = None,
+        sparse_model_name : str = "prithvida/Splade_PP_En_V1" # <--- Default SPLADE model
     ):
         self.backend = backend
+        
+        # 1. initialize Dense Model
         self.embeddings = embeddings or HuggingFaceEmbeddings(
             model_name = settings.EMBEDDING_MODEL,
-            model_kwargs = {'device': 'cpu'},
-            encode_kwargs = {'normalize_embedding': True}
+            model_kwargs = {"device" : "cpu"},
+            encode_kwargs = {'normalize_embeddings': True}
         )
         
-        # BM25 index for sparse retrieval (in-memory for demo) 
-        self.bm25_indices: Dict[str, BM25Okapi] = {}
-        self.bm25_docs: Dict[str, List[Dict[str, Any]]] = {}
+        # 2. initialize Sparse Model (SPLADE)
+        # FastEmbed handels downloading and caching the model automatically.
+        self.sparse_model = SparseTextEmbedding(model_name=sparse_model_name)
         
-        
-    async def add_document(
+    async def add_documents(
         self,
-        text: str,
-        embedding : Optional[List[float]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        texts: List[str],
+        metadatas: Optional[List[Dict[str, Any]]] = None,
         collection: str = "default"
-    ) -> str:
+    ) -> List[str]:
         """
-        Add a document to the vector store.
-        
-        Args:
-            text: Document text
-            embedding: Pre-computed embedding (optional)
-            metadata: Document metadata
-            collection : Collection name
+        Generates both Dense and Sparse embeddings and uploads them.
         """
-        # Generate embedding if not provided
-        if embedding in None:
-            embedding = await self.embeddings.aembed_query(text)
+        if metadatas is None:
+            metadatas= [{} for _ in texts]
             
-        # Add to backend
-        doc_id = await self.backend.add_document(
-            text=text,
-            embedding= embedding,
-            metadata= metadata or {},
-            collection = collection
-        )
+        # 1. Generate Dense Embeddings (Async Batch)
+        dense_embeddings = await self.embeddings.aembed_documents(texts)
         
-        # Update BM25 index
-        await self._update_bm25_index(collection, text, doc_id, metadata or {})
+        # 2. Generate Sparse Embeddings (Sync Batch Via FastEmbed)
+        # fastembed return a generator, so we cast to list.
+        # It handles tokenization and weight generation (SPLADE logic) internally.
         
-        return doc_id
+        sparse_embeddings = list(self.sparse_model.embed(texts))
+        
+        # 3. Combine Data
+        documents_to_add = []
+        for i, text in enumerate(texts):
+            documents_to_add.append({
+                "text" : text,
+                "dense_embedding": dense_embeddings[i],
+                "sparse_embedding" : sparse_embeddings[i], # Contains .indices and values
+                "metadata": metadatas[i]
+            })
+        
+        # 4. Upload to Backend
+        return await self.backend.add_document_batch(documents_to_add, collection)
     
-    async def _update_bm25_index(
+    async def search(
         self,
-        collection:str,
-        text: str,
-        doc_id: str,
-        metadata: Dict[str, Any]
-    ):
-        """Update BM25 index for sparse retrieval"""
-        # Tokenize text
-        tokens = text.lower().split()
-        
-        # Add to collection's BM25 index
-        if collection not in self.bm25_docs:
-            self.bm25_docs[collection] = []
-            
-        self.bm25_docs[collection].append({
-            "id" : doc_id,
-            "text" : text,
-            "tokens": tokens,
-            "metadata" : metadata
-        })
-        
-        # Rebuild BM25 index
-        all_tokens = [doc["tokens"] for doc in self.bm25_docs[collection]]
-        self.bm25_indices[collection] = BM25Okapi(all_tokens)
-        
-        
-    async def similarity_search(
-        self,
-        query_embedding: List[float],
+        query: str ,
         collection: str = "default",
-        top_k: int = 10,
-        filter : Optional[Dict[str, Any]] = None
+        top_k : int = 10,
+        enable_hybrid: bool = True,
+        filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """Dense Vector Search"""
+        """
+        Performs Hybrid Search using generated embeddings.
+        """
+        # 1. Generate Dense Vector
+        query_dense = await self.embeddings.aembed_query(query)
+        
+        # 2. generate sparse Vector (if enabled)
+        query_sparse = None
+        if enable_hybrid:
+            query_sparse = list(self.sparse_model.embed([query]))[0]
+            
+        # 3. Search Backend
         return await self.backend.similarity_search(
-            query_embedding= query_embedding,
-            collection= collection,
-            top_k= top_k,
+            query_dense = query_dense,
+            collection = collection,
+            query_sparse= query_sparse,
+            top_k = top_k,
             filter= filter
         )
         
-    async def bm25_search(
-        self,
-        query: str,
-        collection: str = "default",
-        top_k : int = 10
-    )-> List[Dict[str, Any]]:
-        """Sparse BM25 search"""
-        if collection not in self.bm25_indices:
-            return []
-        
-        # Tokenize query
-        query_tokens = query.lower().split()
-        
-        # GEt BM25 scores
-        scores = self.bm25_indices[collection].get_scores(query_tokens)
-        
-        # Get top-k results
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        
-        results = []
-        for idx in top_indices:
-            if idx < len(self.bm25_docs[collection]):
-                doc = self.bm25_docs[collection][idx]
-                results.append({
-                    "id" : doc["id"],
-                    "score" : float(scores[idx]),
-                    "text" : doc["text"],
-                    "metadata" : doc["metadata"]
-                })
-        
-        return results
+# Factor function 
+def create_vector_store(backend_type: str = "pinecone") -> VectorStore:
+    if backend_type == "pinecone":
+        backend= PineconeBackend()
+    elif backend_type == "qdrant":
+        backend = QdrantBackend()
+    else:
+        raise ValueError(f"Unknown backend: {backend_type}")
     
-    async def hybrid_search(
-        self,
-        query: str,
-        collection: str = "default",
-        top_k: int = 10,
-        dense_weight: float= 0.7,       # Semantic
-        sparse_weight: float = 0.3      # Keyword
-    ) -> Dict[str, Any]:
-        """
-        Hybrid search combining dense and sparse retrieval.
-        
-        Args:
-            query: Search query
-            collection: Collection name
-            top_k: Number of results
-            dense_weight: Weight for dense search (0-1)
-            sparse_weight: Weight for sparse search (0-1)
-            
-        Returns:
-            Dict with dense, sparse, and reranked results
-        """
-        # Generate query embedding
-        query_embedding = await self.embeddings.aembed_query(query)
-        
-        # Dense Search
-        dense_results = await self.similarity_search(
-            query_embedding= query_embedding,
-            collection = collection,
-            top_k = top_k * 2  # Get more for reranking
-        )
-        
-        # Sparse Search
-        sparse_results = await self.bm25_search(
-            query= query,
-            collection= collection,
-            top_k= top_k *2
-        )
-        
-        # Combine and rerank
-        reranked = self._rerank_results(
-            dense_results,
-            sparse_results,
-            dense_weight, #  0.7
-            sparse_weight, # 0.3
-            top_k
-        )
-        
-        return{
-            "dense_results" : dense_results[:top_k],
-            "sparse_results" : sparse_results[:top_k],
-            "reranked_results": reranked
-        }
-        
-    
-    def _rerank_results(
-        self,
-        dense_results: List[Dict[str, Any]],
-        sparse_results: List[Dict[str, Any]],
-        dense_weight : float,
-        sparse_weight : float,
-        top_k: int
-    ) -> List[Dict[str, Any]]:
-        """Rerank results using reciprocal rank fusion"""    
-        # Normalize Weights
-        total_weight = dense_weight + sparse_weight
-        dense_weight = dense_weight / total_weight
-        sparse_weight = sparse_weight / total_weight
-        
-        # Create combined scores
-        scores: Dict[str, float] = {}
-        doc_data: Dict[str, Dict[str, Any]] = {}
-        
-        # Add dense scores ("Meaning")
-        for rank, result in enumerate(dense_results, 1):
-            doc_id = result["id"]
-            scores[doc_id] = dense_weight / (rank + 60) # Reciprocal Rank Fusion (RRF) with k=60 
-            doc_data[doc_id] = result
-        
-        # Add sparse scores ("Keyword")
-        for rank, result in enumerate(sparse_results, 1):
-            doc_id = result["id"]
-            if doc_id in scores:
-                scores[doc_id] += sparse_weight / (rank + 60)
-            else:
-                scores[doc_id] = sparse_weight / (rank + 60)
-                doc_data[doc_id] = result
-        
-        # Sort by combined score
-        sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+    return VectorStore(backend= backend)
 
-        # Return top-k
-        return [
-            {**doc_data[doc_id], "hybrid_score": scores[doc_id]}
-            for doc_id in sorted_ids[:top_k]
-        ]
+        
+        
     
-    async def delete_document(self, doc_id: str, collection: str = "default"):
-        """Delete a document"""
-        await self.backend.delete_document(doc_id, collection)
     
-    async def update_document(
-        self,
-        doc_id: str,
-        embedding: List[float],
-        metadata: Dict[str, Any],
-        collection: str = "default"
-    ):
-        """Update a document"""
-        await self.backend.update_document(doc_id, embedding, metadata, collection)
-    
-    async def get_document(
-        self,
-        doc_id: str,
-        collection: str = "default"
-    ) -> Optional[Dict[str, Any]]:
-        """Get a document by ID"""
-        return await self.backend.get_document(doc_id, collection)
     
 
 # Factory function
